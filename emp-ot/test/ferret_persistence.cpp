@@ -11,6 +11,24 @@ using namespace emp;
 #if !(__EMSCRIPTEN__ || THREADING)
 namespace {
 
+// Cached setup only exchanges whether both parties have a preprocessing file.
+// Model the cached peer so persistence can be tested without a network socket.
+class CachedPeerIO : public IOChannel<CachedPeerIO> {
+public:
+	void send_data_internal(const void *data, size_t size) {
+		if (size != sizeof(bool) || !*static_cast<const bool *>(data))
+			throw std::runtime_error("Expected the cached-data presence handshake");
+	}
+
+	void recv_data_internal(void *data, size_t size) {
+		if (size != sizeof(bool))
+			throw std::runtime_error("Unexpected communication during cached setup");
+		*static_cast<bool *>(data) = true;
+	}
+
+	void flush() {}
+};
+
 // Keep checks active in Release builds, where assert() is disabled.
 bool check(bool condition, const char *message) {
 	if (!condition)
@@ -55,7 +73,9 @@ public:
 	}
 };
 
-bool test_persistence(int party, NetIO **ios) {
+bool test_persistence(int party) {
+	CachedPeerIO io;
+	CachedPeerIO *ios[] = {&io};
 	const PrimalLPNParameter param = ferret_b10;
 	const int64_t party64 = party;
 	const block delta = party == ALICE
@@ -82,7 +102,8 @@ bool test_persistence(int party, NetIO **ios) {
 
 	bool ok = true;
 	{
-		FerretCOT<NetIO> ferret(party, 1, ios, false, true, param, fixture.path);
+		FerretCOT<CachedPeerIO> ferret(party, 1, ios, false, true, param, fixture.path);
+		CHECK_INITIALIZE_EXCEPTION();
 		ok = check(cmpBlock(&ferret.Delta, &delta, 1),
 			"Cached preprocessing restored the wrong Delta") && ok;
 	}
@@ -104,43 +125,34 @@ bool test_persistence(int party, NetIO **ios) {
 	append(expected_state, delta);
 	expected_state.insert(expected_state.end(), payload, payload + payload_size);
 	{
-		FerretCOT<NetIO> restored(party, 1, ios, false, true, param, fixture.path);
+		FerretCOT<CachedPeerIO> restored(party, 1, ios, false, true, param, fixture.path);
+		CHECK_INITIALIZE_EXCEPTION();
 		std::vector<unsigned char> state(restored.state_size());
 		restored.assemble_state(state.data(), state.size());
 		ok = check(state == expected_state,
 			"Reloading persisted preprocessing changed the restored state") && ok;
 	}
 
-	// The existing ./run helper only returns BOB's exit status. Propagate either
-	// party's failed checks so CTest also catches failures reported by ALICE.
-	bool peer_ok = false;
-	ios[0]->send_data(&ok, sizeof(ok));
-	ios[0]->flush();
-	ios[0]->recv_data(&peer_ok, sizeof(peer_ok));
-	return ok && peer_ok;
+	return ok;
 }
 
 } // namespace
 #endif
 
-int main(int argc, char **argv) {
+int main() {
 #if __EMSCRIPTEN__ || THREADING
 	std::cout << "Skipping Ferret persistence: file caching is disabled" << std::endl;
 	return 77;
 #else
-	if (argc < 3) {
-		std::cerr << "Usage: " << argv[0] << " party port" << std::endl;
-		return 1;
-	}
 	try {
-		int party, port;
-		parse_party_and_port(argv, &party, &port);
-		std::unique_ptr<NetIO> io(new NetIO(party == ALICE ? nullptr : "127.0.0.1", port));
-		NetIO *ios[] = {io.get()};
-		if (!test_persistence(party, ios))
-			return 1;
-		std::cout << "Ferret persistence passed for party " << party << std::endl;
-		return 0;
+		bool ok = true;
+		for (int party : {ALICE, BOB}) {
+			const bool passed = test_persistence(party);
+			ok = passed && ok;
+			if (passed)
+				std::cout << "Ferret persistence passed for party " << party << std::endl;
+		}
+		return ok ? 0 : 1;
 	} catch (const std::exception &error) {
 		std::cerr << error.what() << std::endl;
 		return 1;
