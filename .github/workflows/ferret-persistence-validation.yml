@@ -1,0 +1,77 @@
+name: Ferret persistence validation
+on: [push]
+permissions:
+  contents: read
+jobs:
+  persistence:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: release
+            build_type: Release
+            flags: ''
+          - kind: asan
+            build_type: Debug
+            flags: '-fsanitize=address -fno-omit-frame-pointer'
+    env:
+      ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Build EMP tool dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S emp-tool -B build/emp-tool -DTHREADING=OFF -DCRYPTO_IN_CIRCUIT=OFF -DENABLE_EMP_TOOL_TEST=OFF -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/emp-install" -DCMAKE_POLICY_VERSION_MINIMUM=3.10
+          cmake --build build/emp-tool --parallel 2
+          cmake --install build/emp-tool
+      - name: Build regression test
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S emp-ot -B build/emp-ot -DTHREADING=OFF -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_CXX_FLAGS='${{ matrix.flags }}' -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/emp-install" -DCMAKE_POLICY_VERSION_MINIMUM=3.10
+          cmake --build build/emp-ot --target test_ferret_persistence --parallel 2
+      - name: Fixed persistence round trip
+        shell: bash
+        run: ctest --test-dir build/emp-ot -R '^ferret_persistence$' --output-on-failure
+      - name: Confirm regression catches original bug
+        shell: bash
+        env:
+          VALIDATION_KIND: ${{ matrix.kind }}
+        run: |
+          set -euo pipefail
+          if [ "$VALIDATION_KIND" = asan ]; then
+            git show HEAD~2:emp-ot/emp-ot/ferret/ferret_cot.hpp > emp-ot/emp-ot/ferret/ferret_cot.hpp
+          else
+            python3 - <<'PY'
+          from pathlib import Path
+          path = Path('emp-ot/emp-ot/ferret/ferret_cot.hpp')
+          source = path.read_text()
+          old = '\tint64_t party64 = party;\n\tfio.send_data(&party64, sizeof(int64_t));'
+          assert source.count(old) == 1
+          path.write_text(source.replace(old, '\tfio.send_data(&party, sizeof(int64_t));'))
+          PY
+          fi
+          cmake --build build/emp-ot --target test_ferret_persistence --parallel 2
+          set +e
+          ctest --test-dir build/emp-ot -R '^ferret_persistence$' --output-on-failure > "$RUNNER_TEMP/regression-before.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/regression-before.log"
+          test "$result" -ne 0
+          if [ "$VALIDATION_KIND" = asan ]; then
+            grep -q 'AddressSanitizer: stack-buffer-overflow' "$RUNNER_TEMP/regression-before.log"
+          else
+            grep -q 'Persisted party must be a canonical eight-byte integer' "$RUNNER_TEMP/regression-before.log"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ferret-persistence-${{ matrix.kind }}
+          path: |
+            build/emp-ot/Testing/Temporary/LastTest.log
+            ${{ runner.temp }}/regression-before.log
